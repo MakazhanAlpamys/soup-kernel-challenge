@@ -1,0 +1,124 @@
+# Participant 3: NF4 and ввсеLoRA
+
+Status: first decoder candidate implemented, NOT CUDA-validated or benchmarked.
+The local machine is macOS without torch, Triton or a CUDA GPU. No speed or memory
+improvement has been measured. This is not a final hackathon submission.
+
+## Changes to the proposed work plan
+
+1. Inspect the INSTALLED bitsandbytes version on Kaggle before replacing a path.
+   In 0.50.2, MatMul4Bit.forward calls gemm_4bit; the CUDA dispatcher chooses
+   custom GEMM or dequantization + linear depending on hardware and geometry.
+   MatMul4Bit.backward reconstructs W for dX. It does not save a dense W in ctx.
+   Thus removing a supposed persistent dense W per layer is not an established
+   saving. Measure lifetimes and allocation peaks first.
+2. First deliverable: independently written Triton NF4 decoder, including fused
+   nested-scale decode. Candidate patch changes functional dequantize_4bit only,
+   primarily used by backward. Direct torch.ops calls in forward are unaffected.
+3. Keep the existing PEFT LoRA forward and dropout unchanged in this milestone.
+4. A global output scratch buffer must NOT be returned by a generic dequant API:
+   callers can retain it for autograd or ordinary use. If implementing a custom
+   linear later, control the lifetime within forward/backward and synchronize
+   reuse across streams. Do not save scratch in ctx.
+5. Decode + torch matmul still materializes ONE dense W. Only fused tiled
+   dequant-matmul eliminates that full temporary. Scratch reuse alone does not.
+6. No attention implementation in this workstream. It expands scope and requires
+   its own causal/GQA/masking/backward validation for a relatively small hotspot.
+
+## Integration contract
+
+All executable files are under solution/. The team's integrator should preserve
+their combined apply() and ADD this call, rather than replace their __init__.py:
+
+```python
+from .nf4 import patch_dequantize
+patch_dequantize()
+```
+
+The patch is idempotent; unsupported dtype, CPU, non-NF4 and unsupported nested
+formats fall back to bitsandbytes. No model configuration, parameters, LoRA,
+dropout, optimizer, dataset or metrics are changed. A fresh output is allocated
+for each public dequant call (unless caller supplies out). The candidate preserves
+the bnb legacy transposed packed-input return convention. Kernels launch normally
+without CUDA graphs, hidden inputs or measurement-dependent behavior.
+
+## NF4 data format
+
+Canonical source weight is [out_features, in_features], flattened row-major.
+One byte contains two indices: high nibble first, low nibble second. Each index
+selects one of 16 NF4 values; its scale is selected by flat_index // blocksize.
+Use quant_state.shape, NOT packed.shape, for dense geometry.
+
+Nested statistics: quant_state.absmax is uint8, not a float scale. Decode it via
+state2.code[absmax[b]] * state2.absmax[b // state2.blocksize], then add offset,
+in FP32. Multiply NF4 value by that scale and round to quant_state.dtype.
+The Triton launch disables multiply-add fusion to preserve separate rounding.
+No persistent decoded scales or weights are cached.
+
+Expected Qwen shapes [out, in], to verify on the actual model:
+
+| Projection | Shape |
+|---|---|
+| q_proj / o_proj | 1536 x 1536 |
+| k_proj / v_proj | 256 x 1536 |
+| gate_proj / up_proj | 8960 x 1536 |
+| down_proj | 1536 x 8960 |
+
+LoRA is only on q_proj/v_proj for this task. Its effective scaling is alpha/r=2.
+The actual branch is B(A(dropout(x))), NOT B(A(x)). Keep the original dropout
+call/order/RNG consumption. Preserve autocast and dtype rounding boundaries.
+Do not train base W. Incoming backward gradients already include loss scaling;
+do not divide or multiply by the scaler a second time.
+
+## Kaggle validation sequence
+
+Use the official notebook's pinned environment; do not install packages during
+the measured process. Copy solution files into the platform-created team repo.
+
+```bash
+python -m unittest solution.test_nf4 -v
+mkdir -p runs
+python -m solution.bench_nf4 --tokens 512 --iterations 100 > runs/nf4_micro_512.json
+python -m solution.bench_nf4 --tokens 2048 --iterations 100 > runs/nf4_micro_2048.json
+SOUP_APPLY_SOLUTION=1 python -m pytest tests -q
+python harness/run_task.py --repeats 2
+python harness/check_rules.py
+```
+
+CPU-only tests are explicitly skipped for CUDA cases: a CPU pass is NOT a GPU
+pass. GPU tests compare all projection geometries, nested/plain scales, FP16/FP32,
+all 16 codes, odd tails, supported block sizes, out=, transposed input, FP4
+fallback, scaled dX and a two-layer backward. Microbenchmarks compare preallocated
+decode and actual bnb forward+backward. They exclude JIT warmup and do not replace
+official cold-cache full-command timing or nvidia-smi peak measurements.
+
+Acceptance: all GPU tests pass, complete training passes official checks, and
+the combined solution satisfies >=5% useful own-kernel time in EVERY measured
+run. A decoder alone may not reach 5%; measure team-wide coverage. Keep the patch
+only if the combined measured outcome improves. Benchmark full load/train/save
+memory before claiming a memory reduction.
+
+## Next milestones after CUDA feedback
+
+- Record actual quant states and profiler evidence; fix correctness before tuning.
+- Evaluate decode bandwidth and full-step benefit; reduce repeated scale loads if
+  profiling justifies it. Avoid large autotuning searches: compilation counts.
+- Consider controlled scratch in a custom linear backward only after evidence
+  that allocation/lifetime is a bottleneck.
+- Try LoRA second GEMM plus scaling/add epilogue with existing dropout. Validate
+  gradients of x, A and B at actual FP32/FP16/autocast boundaries against PEFT.
+- Fused NF4 matmul is a stretch goal only if decoder/integration are stable.
+
+## Sources (format/API/ideas only; no foreign kernel code copied)
+
+- QLoRA, Dettmers et al., 2023: https://arxiv.org/abs/2305.14314
+- bnb 0.50.2 autograd and ctx lifetime:
+  https://github.com/bitsandbytes-foundation/bitsandbytes/blob/0.50.2/bitsandbytes/autograd/_functions.py
+- bnb 0.50.2 nested quant state and dequant API:
+  https://github.com/bitsandbytes-foundation/bitsandbytes/blob/0.50.2/bitsandbytes/functional.py
+- bnb 0.50.2 CUDA dispatcher:
+  https://github.com/bitsandbytes-foundation/bitsandbytes/blob/0.50.2/bitsandbytes/backends/cuda/ops.py
+- PEFT 0.20.0 LoRA behavior:
+  https://github.com/huggingface/peft/blob/v0.20.0/src/peft/tuners/lora/bnb.py
+- Model dimensions:
+  https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/blob/main/config.json
